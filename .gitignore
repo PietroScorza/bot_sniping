@@ -1,0 +1,32 @@
+# Build output
+/target/
+Cargo.lock
+
+# Environment files (NEVER commit these!)
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# State backups
+state_backup.json
+positions.json
+
+# Keys (CRITICAL: Never commit!)
+*.key
+*.pem
+keypair.json
+wallet.json
