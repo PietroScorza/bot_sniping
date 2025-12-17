@@ -206,7 +206,7 @@ impl HeliusGrpcClient {
                 DetectedAction::Sell { signature, slot } => {
                     info!("🚨 TARGET SELL DETECTED! Signature: {} (slot: {})", signature, slot);
                     
-                    // For sells, we would need to track our positions
+                    // Extract token mint
                     let token_mint = if let Some(mint) = self.extract_token_from_logs(&logs) {
                         Some(mint)
                     } else {
@@ -218,7 +218,18 @@ impl HeliusGrpcClient {
                     
                     if let Some(mint) = token_mint {
                         info!("🪙 Token being sold: {}", mint);
-                        warn!("⚠️ Auto-sell not yet implemented - manual action may be needed!");
+                        
+                        // Execute copy sell - sell ALL our tokens of this mint
+                        match self.execute_copy_sell(&mint, &signature).await {
+                            Ok(our_sig) => {
+                                info!("✅ COPY SELL EXECUTED! Our signature: {}", our_sig);
+                            }
+                            Err(e) => {
+                                error!("❌ Copy sell failed: {:?}", e);
+                            }
+                        }
+                    } else {
+                        warn!("⚠️ Could not extract token mint from sell transaction");
                     }
                 }
                 DetectedAction::Unknown { signature, slot } => {
@@ -420,6 +431,127 @@ impl HeliusGrpcClient {
             .context("Failed to send transaction")?;
         
         info!("🚀 Transaction sent: {}", sig);
+        
+        Ok(sig.to_string())
+    }
+    
+    /// Execute a copy sell transaction using Jupiter - sells ALL tokens
+    async fn execute_copy_sell(&self, token_mint: &str, _target_signature: &str) -> Result<String> {
+        let rpc_client = AsyncRpcClient::new(self.rpc_url.clone());
+        
+        info!("🔄 Preparing copy SELL for token: {}", token_mint);
+        
+        // First, get our token balance
+        let token_mint_pubkey = Pubkey::from_str(token_mint)
+            .context("Invalid token mint")?;
+        
+        // Get associated token account
+        let ata = spl_associated_token_account::get_associated_token_address(
+            &self.our_keypair.pubkey(),
+            &token_mint_pubkey,
+        );
+        
+        // Get token balance
+        let token_balance = match rpc_client.get_token_account_balance(&ata).await {
+            Ok(balance) => {
+                let amount = balance.amount.parse::<u64>().unwrap_or(0);
+                info!("💰 Our token balance: {} (raw: {})", balance.ui_amount.unwrap_or(0.0), amount);
+                amount
+            }
+            Err(e) => {
+                warn!("⚠️ Could not get token balance: {:?}", e);
+                return Err(anyhow::anyhow!("No tokens to sell - account not found or empty"));
+            }
+        };
+        
+        if token_balance == 0 {
+            info!("ℹ️ No tokens to sell - balance is 0");
+            return Err(anyhow::anyhow!("No tokens to sell"));
+        }
+        
+        // Use Jupiter to sell tokens back to SOL
+        let client = reqwest::Client::new();
+        
+        // Step 1: Get quote (selling tokens for SOL)
+        let quote_url = format!(
+            "https://quote-api.jup.ag/v6/quote?inputMint={}&outputMint={}&amount={}&slippageBps=2000",
+            token_mint,      // Input: our tokens
+            WSOL_MINT,       // Output: SOL
+            token_balance    // Amount: ALL our tokens
+        );
+        
+        info!("📊 Getting Jupiter SELL quote for {} tokens...", token_balance);
+        let quote_response = client.get(&quote_url)
+            .send()
+            .await
+            .context("Failed to get Jupiter quote")?;
+        
+        if !quote_response.status().is_success() {
+            let error_text = quote_response.text().await.unwrap_or_default();
+            error!("Jupiter quote error: {}", error_text);
+            return Err(anyhow::anyhow!("Jupiter quote failed: {}", error_text));
+        }
+        
+        let quote_data: serde_json::Value = quote_response.json().await
+            .context("Failed to parse Jupiter quote")?;
+        
+        let out_amount = quote_data.get("outAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        
+        info!("✅ Got quote: will receive ~{} SOL", out_amount as f64 / 1_000_000_000.0);
+        
+        // Step 2: Get swap transaction from Jupiter
+        let swap_url = "https://quote-api.jup.ag/v6/swap";
+        let swap_request = serde_json::json!({
+            "quoteResponse": quote_data,
+            "userPublicKey": self.our_keypair.pubkey().to_string(),
+            "wrapAndUnwrapSol": true,
+            "dynamicComputeUnitLimit": true,
+            "prioritizationFeeLamports": self.tip_amount
+        });
+        
+        info!("🔨 Building SELL swap transaction...");
+        let swap_response = client.post(swap_url)
+            .json(&swap_request)
+            .send()
+            .await
+            .context("Failed to get Jupiter swap")?;
+        
+        if !swap_response.status().is_success() {
+            let error_text = swap_response.text().await.unwrap_or_default();
+            error!("Jupiter swap error: {}", error_text);
+            return Err(anyhow::anyhow!("Jupiter swap failed: {}", error_text));
+        }
+        
+        let swap_data: serde_json::Value = swap_response.json().await
+            .context("Failed to parse Jupiter swap")?;
+        
+        // Extract the serialized transaction
+        let swap_transaction = swap_data.get("swapTransaction")
+            .and_then(|v| v.as_str())
+            .context("No swap transaction in response")?;
+        
+        // Decode and sign the transaction
+        let tx_bytes = BASE64.decode(swap_transaction)
+            .context("Failed to decode transaction")?;
+        
+        let mut versioned_tx: VersionedTransaction = bincode::deserialize(&tx_bytes)
+            .context("Failed to deserialize transaction")?;
+        
+        // Sign the transaction
+        info!("✍️ Signing SELL transaction...");
+        let message_bytes = versioned_tx.message.serialize();
+        let signature = self.our_keypair.sign_message(&message_bytes);
+        versioned_tx.signatures[0] = signature;
+        
+        // Send the transaction
+        info!("📤 Sending SELL transaction...");
+        let sig = rpc_client.send_transaction(&versioned_tx).await
+            .context("Failed to send transaction")?;
+        
+        info!("🚀 SELL Transaction sent: {}", sig);
         
         Ok(sig.to_string())
     }
