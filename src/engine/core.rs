@@ -25,6 +25,8 @@ impl TradingEngine {
             .keypair(keypair)
             .buy_amount_sol(config.buy_amount_sol)
             .tip_amount(config.tip_amount_normal)
+            .take_profit_enabled(config.take_profit_enabled)
+            .take_profit_tiers(config.take_profit_tiers.clone())
             .reconnect_delay_ms(config.reconnect_delay_ms)
             .max_reconnect_attempts(config.max_reconnect_attempts)
             .build()?;
