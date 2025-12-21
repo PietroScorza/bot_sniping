@@ -1,4 +1,4 @@
-//! Helius Transaction Stream Client
+﻿//! Helius Transaction Stream Client
 //! 
 //! This module provides a WebSocket-based client for streaming transactions
 //! from Helius RPC with automatic reconnection.
@@ -254,20 +254,46 @@ impl HeliusGrpcClient {
                 DetectedAction::Buy { signature, slot } => {
                     info!("🎯 TARGET BUY DETECTED! Signature: {} (slot: {})", signature, slot);
                     
+                    // DEBUG: Print first 5 log lines to see what we're working with
+                    info!("📋 Log sample (first 5 lines): {:?}", logs.iter().take(5).collect::<Vec<_>>());
+                    
                     // Extract token mint ONLY from logs - NEVER fetch transaction (adds 50-150ms latency)
-                    let token_mint = self.extract_token_from_logs(&logs);
+                    let token_mint = match self.extract_token_from_logs(&logs) {
+                        Some(m) => Some(m),
+                        None => {
+                            // Some log streams do not include the mint pubkey reliably.
+                            // Fallback (slower): fetch the full transaction once to extract the mint.
+                            warn!(
+                                "⚠️ Could not extract token mint from logs; falling back to getTransaction (adds latency)"
+                            );
+                            match self.extract_token_from_transaction(&signature).await {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!("⚠️ getTransaction mint fallback failed: {:?}", e);
+                                    None
+                                }
+                            }
+                        }
+                    };
                     
                     if let Some(mint) = token_mint {
                         info!("🪙 Token mint: {}", mint);
+                        
+                        // Check if we already have a position in this token (avoid duplicate buys)
+                        {
+                            let positions = self.positions.read().await;
+                            if positions.contains_key(&mint) {
+                                info!("⏭️ Already have position in {} - skipping duplicate buy", &mint[..8.min(mint.len())]);
+                                continue;
+                            }
+                        }
                         
                         // Execute copy buy IMMEDIATELY - no delays
                         match self.execute_copy_buy(&mint, &signature).await {
                             Ok(our_sig) => {
                                 info!("✅ COPY BUY EXECUTED! Sig: {}", our_sig);
-                                // Add position for TP tracking
-                                if self.take_profit_enabled && !self.take_profit_tiers.is_empty() {
-                                    self.add_position(mint.clone(), self.buy_amount_sol, 0).await;
-                                }
+                                // ALWAYS add position (needed for sell fallback + TP tracking)
+                                self.add_position(mint.clone(), self.buy_amount_sol, 0).await;
                             }
                             Err(e) => {
                                 error!("❌ Copy buy failed: {:?}", e);
@@ -280,8 +306,56 @@ impl HeliusGrpcClient {
                 DetectedAction::Sell { signature, slot } => {
                     info!("🚨 TARGET SELL DETECTED! Signature: {} (slot: {})", signature, slot);
                     
-                    // Extract token mint ONLY from logs - NEVER fetch transaction
-                    let token_mint = self.extract_token_from_logs(&logs);
+                    // DEBUG: Print first 5 log lines to see what we're working with
+                    info!("📋 Sell Log sample (first 5 lines): {:?}", logs.iter().take(5).collect::<Vec<_>>());
+                    
+                    // Try to extract token mint from logs first (fastest)
+                    let token_mint = match self.extract_token_from_logs(&logs) {
+                        Some(m) => Some(m),
+                        None => {
+                            // Fallback 1: fetch the full transaction to extract the mint
+                            warn!("⚠️ Could not extract token mint from sell logs; trying getTransaction fallback...");
+                            match self.extract_token_from_transaction(&signature).await {
+                                Ok(Some(m)) => {
+                                    info!("✅ Found mint from transaction: {}", m);
+                                    Some(m)
+                                }
+                                Ok(None) => {
+                                    // Fallback 2: Use our active positions - if we only have ONE position, sell that
+                                    warn!("⚠️ getTransaction didn't return mint; checking active positions...");
+                                    let positions = self.positions.read().await;
+                                    if positions.len() == 1 {
+                                        // We only have one position - this must be the one being sold
+                                        let mint = positions.keys().next().unwrap().clone();
+                                        info!("📍 Found single active position: {}", mint);
+                                        Some(mint)
+                                    } else if positions.len() > 1 {
+                                        warn!("⚠️ Multiple positions active ({}), cannot determine which to sell", positions.len());
+                                        // List the positions for debugging
+                                        for (mint, _) in positions.iter() {
+                                            info!("   - Position: {}", mint);
+                                        }
+                                        None
+                                    } else {
+                                        warn!("⚠️ No active positions to sell");
+                                        None
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("⚠️ getTransaction fallback failed: {:?}", e);
+                                    // Still try positions fallback
+                                    let positions = self.positions.read().await;
+                                    if positions.len() == 1 {
+                                        let mint = positions.keys().next().unwrap().clone();
+                                        info!("📍 Using single active position: {}", mint);
+                                        Some(mint)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    };
                     
                     if let Some(mint) = token_mint {
                         info!("🪙 Token being sold: {}", mint);
@@ -306,7 +380,7 @@ impl HeliusGrpcClient {
                             }
                         }
                     } else {
-                        warn!("⚠️ Could not extract token mint from sell transaction");
+                        warn!("⚠️ Could not extract token mint from sell transaction - all fallbacks failed");
                     }
                 }
                 DetectedAction::Unknown { signature, slot } => {
@@ -354,30 +428,91 @@ impl HeliusGrpcClient {
     
     /// Extract token mint from transaction logs
     fn extract_token_from_logs(&self, logs: &[String]) -> Option<String> {
-        // Look for token mint in logs - Pump.fun logs contain mint info
-        // Format: "Program log: <mint_pubkey>"
-        for log in logs {
-            // Skip non-relevant logs
-            if log.contains("Program log:") {
-                let parts: Vec<&str> = log.split_whitespace().collect();
-                for part in parts {
-                    // Check if it's a valid pubkey (32 bytes base58)
-                    if part.len() >= 32 && part.len() <= 44 {
-                        if let Ok(pubkey) = Pubkey::from_str(part) {
-                            // Exclude known programs and SOL
-                            let pubkey_str = pubkey.to_string();
-                            if pubkey_str != PUMPFUN_PROGRAM 
-                                && pubkey_str != WSOL_MINT
-                                && pubkey_str != self.target_wallet.to_string()
-                                && !pubkey_str.starts_with("1111") // system program variants
-                            {
-                                return Some(pubkey_str);
-                            }
+        // Pump.fun logs are not always cleanly whitespace-delimited; pubkeys can be embedded
+        // with punctuation (e.g. "mint=<pubkey>") or appear outside of "Program log:" lines.
+        // We therefore scan every line for base58-like substrings and validate as Pubkey.
+
+        fn is_base58_char(b: u8) -> bool {
+            matches!(
+                b,
+                b'1'..=b'9'
+                    | b'A'..=b'H'
+                    | b'J'..=b'N'
+                    | b'P'..=b'Z'
+                    | b'a'..=b'k'
+                    | b'm'..=b'z'
+            )
+        }
+
+        fn extract_pubkeys_from_line(line: &str) -> Vec<String> {
+            let bytes = line.as_bytes();
+            let mut out = Vec::new();
+            let mut i = 0usize;
+            while i < bytes.len() {
+                while i < bytes.len() && !is_base58_char(bytes[i]) {
+                    i += 1;
+                }
+                let start = i;
+                while i < bytes.len() && is_base58_char(bytes[i]) {
+                    i += 1;
+                }
+                let end = i;
+                let len = end.saturating_sub(start);
+                if (32..=44).contains(&len) {
+                    if let Ok(s) = std::str::from_utf8(&bytes[start..end]) {
+                        // Validate it is a real Solana pubkey
+                        if Pubkey::from_str(s).is_ok() {
+                            out.push(s.to_string());
                         }
                     }
                 }
             }
+            out
         }
+
+        let excluded: [&str; 7] = [
+            PUMPFUN_PROGRAM,
+            WSOL_MINT,
+            // common programs (avoid accidental selection)
+            "11111111111111111111111111111111", // system
+            "ComputeBudget111111111111111111111111111111", // compute budget
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", // SPL Token
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb", // Token-2022
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", // Associated Token
+        ];
+
+        let target_wallet = self.target_wallet.to_string();
+        let mut candidates: Vec<String> = Vec::new();
+        for log in logs {
+            candidates.extend(extract_pubkeys_from_line(log));
+        }
+
+        // Prefer pump mints first (most reliable for this bot’s pump-focused flow).
+        if let Some(pump) = candidates
+            .iter()
+            .find(|s| s.ends_with("pump") && *s != &target_wallet && !excluded.contains(&s.as_str()))
+        {
+            return Some(pump.clone());
+        }
+
+        // Otherwise, fall back to the first non-excluded, non-target pubkey.
+        for cand in candidates {
+            if cand == target_wallet {
+                continue;
+            }
+            if excluded.contains(&cand.as_str()) {
+                continue;
+            }
+            if cand.starts_with("1111") {
+                continue;
+            }
+            return Some(cand);
+        }
+
+        debug!(
+            "⚠️ extract_token_from_logs: no mint found; sample logs: {:?}",
+            logs.iter().take(8).collect::<Vec<_>>()
+        );
         None
     }
     
@@ -391,7 +526,8 @@ impl HeliusGrpcClient {
         // Fetch full transaction with metadata
         let tx_config = RpcTransactionConfig {
             encoding: Some(UiTransactionEncoding::JsonParsed),
-            commitment: Some(CommitmentConfig::confirmed()),
+            // Use processed for speed; this is a fallback path only.
+            commitment: Some(CommitmentConfig::processed()),
             max_supported_transaction_version: Some(0),
         };
         
@@ -404,6 +540,16 @@ impl HeliusGrpcClient {
             
             // Look for token balance changes
             if let OptionSerializer::Some(post_token_balances) = meta.post_token_balances {
+                // Prefer pump mints if present.
+                if let Some(pump) = post_token_balances
+                    .iter()
+                    .map(|b| b.mint.clone())
+                    .find(|m| m != WSOL_MINT && m.ends_with("pump"))
+                {
+                    return Ok(Some(pump));
+                }
+
+                // Otherwise return the first non-WSOL mint.
                 for balance in post_token_balances.iter() {
                     let mint_str = balance.mint.clone();
                     if mint_str != WSOL_MINT {
